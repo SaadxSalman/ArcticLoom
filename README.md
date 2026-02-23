@@ -146,7 +146,7 @@ npm run dev
 | **Frontend** | Next.js 15 (React), Tailwind CSS, Lucide |
 | **Vector DB** | Weaviate Cloud |
 | **Embeddings** | Snowflake Arctic Embed L v2.0 |
-| **LLM** | Meta Llama-3.2-3B- |
+| **LLM** | Meta Llama-3.2-3B-Instruct |
 
 ---
 
