@@ -5,12 +5,29 @@ dotenv.config();
 
 const WEAVIATE_URL = process.env.WEAVIATE_URL;
 const WEAVIATE_API_KEY = process.env.WEAVIATE_API_KEY;
+const COLLECTION_NAME = process.env.WEAVIATE_COLLECTION || 'ArcticLoom_Documents';
 
 let client = null;
 let connected = false;
 
+// Schema definition. Extra metadata lives on every chunk object so the document
+// list can be rebuilt directly from the vector store, without a data folder.
+const COLLECTION_PROPERTIES = [
+  { name: 'content', dataType: 'text', tokenization: 'word' },
+  { name: 'fileName', dataType: 'text' },
+  { name: 'chunkIndex', dataType: 'int' },
+  { name: 'fileType', dataType: 'text' },
+  { name: 'fileSize', dataType: 'int' },
+  { name: 'totalChunks', dataType: 'int' },
+  { name: 'uploadedAt', dataType: 'text' },
+];
+
 export async function initDatabase() {
   if (connected) return client;
+
+  if (!WEAVIATE_URL || !WEAVIATE_API_KEY) {
+    throw new Error('Missing WEAVIATE_URL or WEAVIATE_API_KEY. Add them to your .env file (see .env.example).');
+  }
 
   console.log('Connecting to Weaviate Cloud...');
   client = await weaviate.connectToWeaviateCloud(WEAVIATE_URL, {
@@ -30,71 +47,120 @@ export function isConnected() { return connected; }
 
 export async function ensureCollection() {
   await initDatabase();
-  const exists = await client.collections.exists('ArcticLoom_Documents');
-  if (!exists) {
-    await client.collections.create({
-      name: 'ArcticLoom_Documents',
-      properties: [
-        { name: 'content', dataType: 'text', tokenization: 'word' },
-        { name: 'fileName', dataType: 'text' },
-        { name: 'chunkIndex', dataType: 'int' },
-      ],
-    });
-    console.log('Created ArcticLoom_Documents collection');
+  const exists = await client.collections.exists(COLLECTION_NAME);
+  if (exists) {
+    // Best-effort additive schema sync. Weaviate Cloud ships with auto-schema
+    // enabled, so new properties are normally created automatically on insert.
+    try { await registerMissingProperties(); }
+    catch (e) { console.log('Schema sync skipped (' + e.message + ') - auto-schema will handle new properties.'); }
+    return;
   }
+  await client.collections.create({ name: COLLECTION_NAME, properties: COLLECTION_PROPERTIES });
+  console.log('Created ' + COLLECTION_NAME + ' collection');
 }
+
+async function registerMissingProperties() {
+  if (typeof client.schema === 'undefined') return;
+  try {
+    const existing = await client.schema.get(COLLECTION_NAME);
+    const present = new Set((existing?.properties || []).map(p => p.name));
+    for (const prop of COLLECTION_PROPERTIES) {
+      if (!present.has(prop.name) && typeof client.schema.update === 'function') {
+        await client.schema.update(COLLECTION_NAME, { properties: [prop] });
+        console.log('  Schema: added property "' + prop.name + '"');
+      }
+    }
+  } catch (e) { /* client version may not expose schema API - ignore */ }
+}
+
+// ===================== PART 2 =====================
 
 export async function insertDocument(filename, fileType, fileSize, chunks, embeddings) {
   await initDatabase();
   await ensureCollection();
-  const collection = client.collections.get('ArcticLoom_Documents');
+  const collection = client.collections.get(COLLECTION_NAME);
 
-  // Delete existing chunks for this file
+  // Replace any previously indexed version of this file (fresh re-ingest)
   await collection.data.deleteMany(
     collection.filter.byProperty('fileName').equal(filename)
   );
 
-    // Insert new chunks with pre-computed embeddings
+  const uploadedAt = new Date().toISOString();
   const objects = chunks.map((chunk, i) => ({
     properties: {
       content: chunk.content,
       fileName: filename,
       chunkIndex: i,
+      fileType: fileType || 'unknown',
+      fileSize: fileSize || 0,
+      totalChunks: chunks.length,
+      uploadedAt,
     },
     vectors: embeddings[i],
   }));
 
-  await collection.data.insertMany(objects);
+  // Insert in batches to stay well below request size limits
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < objects.length; i += BATCH_SIZE) {
+    await collection.data.insertMany(objects.slice(i, i + BATCH_SIZE));
+  }
 
   return {
     id: filename,
     filename,
-    fileType,
-    fileSize,
+    fileType: fileType || 'unknown',
+    fileSize: fileSize || 0,
     totalChunks: chunks.length,
+    uploadedAt,
   };
+}
+
+async function fetchAllObjects(collection, returnProperties) {
+  const objects = [];
+  const LIMIT = 500;
+  let offset = 0;
+  while (true) {
+    const page = await collection.query.fetchObjects({
+      returnProperties,
+      limit: LIMIT,
+      offset,
+    });
+    objects.push(...(page.objects || []));
+    if (!page.objects || page.objects.length < LIMIT) break;
+    offset += LIMIT;
+    if (offset > 10000) break; // hard safety cap
+  }
+  return objects;
 }
 
 export async function getAllDocuments() {
   await initDatabase();
   await ensureCollection();
-  const collection = client.collections.get('ArcticLoom_Documents');
+  const collection = client.collections.get(COLLECTION_NAME);
 
-  const result = await collection.query.fetchObjects({
-    returnProperties: ['fileName'],
-    limit: 1000,
-  });
+  const objects = await fetchAllObjects(collection, [
+    'fileName', 'chunkIndex', 'fileType', 'fileSize', 'totalChunks', 'uploadedAt'
+  ]);
 
   const fileMap = {};
-  result.objects.forEach(obj => {
-    const name = obj.properties.fileName;
+  objects.forEach(obj => {
+    const p = obj.properties || {};
+    const name = p.fileName;
+    if (!name) return;
     if (!fileMap[name]) {
-      fileMap[name] = { filename: name, totalChunks: 0 };
+      fileMap[name] = {
+        id: name,
+        filename: name,
+        fileType: p.fileType || 'unknown',
+        fileSize: p.fileSize || 0,
+        totalChunks: 0,
+        uploadedAt: p.uploadedAt || '',
+      };
     }
     fileMap[name].totalChunks++;
   });
 
-  return Object.values(fileMap);
+  return Object.values(fileMap).sort((a, b) => (b.uploadedAt || '').localeCompare(a.uploadedAt || ''));
 }
 
 export async function getDocumentByName(filename) {
@@ -105,7 +171,7 @@ export async function getDocumentByName(filename) {
 export async function deleteDocument(filename) {
   await initDatabase();
   await ensureCollection();
-  const collection = client.collections.get('ArcticLoom_Documents');
+  const collection = client.collections.get(COLLECTION_NAME);
   await collection.data.deleteMany(
     collection.filter.byProperty('fileName').equal(filename)
   );
@@ -113,11 +179,12 @@ export async function deleteDocument(filename) {
 
 export async function clearAllData() {
   await initDatabase();
-  const exists = await client.collections.exists('ArcticLoom_Documents');
+  const exists = await client.collections.exists(COLLECTION_NAME);
   if (exists) {
-    await client.collections.delete('ArcticLoom_Documents');
+    await client.collections.delete(COLLECTION_NAME);
   }
   await ensureCollection();
+  conversations = [];
 }
 
 export async function getDocumentCount() {
@@ -128,20 +195,22 @@ export async function getDocumentCount() {
 export async function getTotalChunkCount() {
   await initDatabase();
   await ensureCollection();
-  const collection = client.collections.get('ArcticLoom_Documents');
+  const collection = client.collections.get(COLLECTION_NAME);
   const result = await collection.aggregate.overAll();
-  return result.totalCount;
+  return result.totalCount || 0;
 }
+
+// ===================== PART 3 =====================
 
 export async function searchSimilar(queryEmbedding, topK = 5, filename = null) {
   await initDatabase();
   await ensureCollection();
-  const collection = client.collections.get('ArcticLoom_Documents');
+  const collection = client.collections.get(COLLECTION_NAME);
 
   const opts = {
     limit: topK,
     returnMetadata: ['distance'],
-    returnProperties: ['content', 'fileName', 'chunkIndex'],
+    returnProperties: ['content', 'fileName', 'chunkIndex', 'fileType', 'totalChunks', 'uploadedAt'],
   };
 
   if (filename) {
@@ -154,12 +223,15 @@ export async function searchSimilar(queryEmbedding, topK = 5, filename = null) {
     content: obj.properties.content,
     filename: obj.properties.fileName,
     chunk_index: obj.properties.chunkIndex,
-    score: 1 - (obj.metadata?.distance || 0),
+    fileType: obj.properties.fileType,
+    uploadedAt: obj.properties.uploadedAt,
+    score: Math.max(0, Math.min(1, 1 - (obj.metadata?.distance || 1))),
   }));
 }
 
-// Conversation history (stored locally since it's small)
-const conversations = [];
+// ==================== CONVERSATION HISTORY (in-memory per session) ====================
+let conversations = [];
+const MAX_CONVERSATIONS = 2000;
 
 export function saveConversation(sessionId, role, content, sources = []) {
   conversations.push({
@@ -169,6 +241,9 @@ export function saveConversation(sessionId, role, content, sources = []) {
     sources: JSON.stringify(sources),
     created_at: new Date().toISOString(),
   });
+  if (conversations.length > MAX_CONVERSATIONS) {
+    conversations = conversations.slice(-MAX_CONVERSATIONS);
+  }
 }
 
 export function getConversationHistory(sessionId, limit = 20) {
@@ -176,4 +251,8 @@ export function getConversationHistory(sessionId, limit = 20) {
     .filter(c => c.session_id === sessionId)
     .slice(-limit)
     .map(c => ({ ...c, sources: JSON.parse(c.sources || '[]') }));
+}
+
+export function clearConversation(sessionId) {
+  conversations = conversations.filter(c => c.session_id !== sessionId);
 }

@@ -1,21 +1,22 @@
 {
   "name": "arcticloom",
-  "version": "2.0.0",
-  "description": "ArcticLoom - Advanced Local RAG Intelligence System",
+  "version": "2.1.0",
+  "description": "ArcticLoom - Advanced RAG Intelligence System (Weaviate Cloud + Hugging Face + local embeddings)",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
     "dev": "node src/index.js",
-    "ingest": "node src/ingest.js",
-    "setup": "node src/setup.js"
+    "setup": "node src/setup.js",
+    "ingest": "node src/ingest.js"
   },
   "keywords": [
     "rag",
     "ai",
     "llm",
     "embeddings",
-    "local"
+    "weaviate",
+    "huggingface"
   ],
   "author": "Saad Salman",
   "license": "ISC",

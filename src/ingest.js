@@ -8,43 +8,96 @@ import { chunkText } from './chunker.js';
 
 dotenv.config();
 
-const DATA_DIR = process.env.DATA_DIR || './data';
+const USAGE = `ArcticLoom CLI Ingest
+=======================
 
-async function ingest() {
-  console.log('ArcticLoom Document Ingestion (Weaviate Cloud)');
-  console.log('==============================================\n');
-  await initDatabase();
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  const files = fs.readdirSync(DATA_DIR).filter(f => !f.startsWith('.') && !f.endsWith('.json'));
-  if (files.length === 0) { console.log('No files found in ' + path.resolve(DATA_DIR)); return; }
-  console.log('Found ' + files.length + ' file(s)\n');
-  await initEmbedder();
-  let totalChunks = 0, processed = 0;
-  for (const file of files) {
-    const filePath = path.join(DATA_DIR, file);
-    if (fs.statSync(filePath).isDirectory()) continue;
-    console.log('Processing: ' + file);
-    try {
-      const parsed = await parseDocument(filePath);
-      const existing = await getDocumentByName(file);
-      if (existing) { console.log('  Re-indexing...'); await deleteDocument(file); }
-      const chunks = chunkText(parsed.text, { chunkSize: parseInt(process.env.CHUNK_SIZE) || 1000, overlap: parseInt(process.env.CHUNK_OVERLAP) || 200 });
-      console.log('  Chunks: ' + chunks.length);
-      const embeddings = [];
-      for (let i = 0; i < chunks.length; i++) {
-        const embedding = await embedText(chunks[i].content);
-        embeddings.push(embedding);
-        if ((i + 1) % 5 === 0 || i === chunks.length - 1) process.stdout.write('\r  Embedding: ' + (i + 1) + '/' + chunks.length);
-      }
-      console.log('');
-      await insertDocument(file, parsed.fileType, parsed.fileSize, chunks, embeddings);
-      totalChunks += chunks.length;
-      processed++;
-      console.log('  Done\n');
-    } catch (error) { console.error('  Error: ' + error.message + '\n'); }
+Ingests explicit file paths into the vector database. There is NO data folder -
+you must always pass the files you want to ingest:
+
+  npm run ingest -- <file1> [file2] [file3 ...]
+
+Examples:
+  npm run ingest -- ./report.pdf ./notes.md ./data.csv
+  node src/ingest.js "C:\\Users\\you\\Documents\\contract.docx"
+
+If a file with the same name is already indexed, it is replaced (re-ingested).
+`;
+
+async function ingestFile(filePath) {
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) {
+    console.error('  ✖ Not found: ' + resolved);
+    return null;
   }
-  console.log('==============================================');
-  console.log('Ingestion complete: ' + processed + ' files, ' + totalChunks + ' chunks');
+  if (fs.statSync(resolved).isDirectory()) {
+    console.error('  ✖ Is a directory (pass files, not folders): ' + resolved);
+    return null;
+  }
+
+  const filename = path.basename(filePath);
+  console.log('Processing: ' + filename);
+
+  const parsed = await parseDocument(resolved);
+  console.log('  Extracted ' + parsed.text.length + ' chars (' + parsed.fileType + ', ' + parsed.fileSize + ' bytes)');
+
+  const existing = await getDocumentByName(filename);
+  if (existing) {
+    console.log('  Re-indexing existing file...');
+    await deleteDocument(filename);
+  }
+
+  const chunks = chunkText(parsed.text, {
+    chunkSize: parseInt(process.env.CHUNK_SIZE) || 1000,
+    overlap: parseInt(process.env.CHUNK_OVERLAP) || 200,
+  });
+  console.log('  Chunks: ' + chunks.length);
+
+  const embeddings = [];
+  for (let i = 0; i < chunks.length; i++) {
+    embeddings.push(await embedText(chunks[i].content));
+    if ((i + 1) % 5 === 0 || i === chunks.length - 1) {
+      process.stdout.write('\r  Embedding: ' + (i + 1) + '/' + chunks.length);
+    }
+  }
+  console.log('');
+
+  const doc = await insertDocument(filename, parsed.fileType, parsed.fileSize, chunks, embeddings);
+  console.log('  ✔ Ingested "' + doc.filename + '" (' + doc.totalChunks + ' chunks)');
+  return doc;
 }
 
-ingest().catch(console.error);
+async function main() {
+  // npm run ingest -- a b c  => argv = [node, src/ingest.js, a, b, c]
+  const targets = process.argv.slice(2);
+
+  if (targets.length === 0) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+
+  console.log('ArcticLoom CLI Ingest');
+  console.log('=====================\n');
+  await initDatabase();
+  await initEmbedder();
+
+  let done = 0;
+  let failed = 0;
+  for (const target of targets) {
+    try {
+      const doc = await ingestFile(target);
+      if (doc) done++; else failed++;
+    } catch (e) {
+      console.error('  ✖ ' + target + ': ' + e.message);
+      failed++;
+    }
+  }
+
+  console.log('\n==============================================');
+  console.log('Ingest complete: ' + done + ' file(s) ingested, ' + failed + ' failed');
+  if (failed > 0) process.exit(1);
+}
+
+main().catch(e => {
+  console.error('Fatal:', e.message);
+  process.exit(1);
+});

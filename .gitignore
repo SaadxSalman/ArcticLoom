@@ -1,5 +1,22 @@
+# dependencies
 node_modules/
+
+# environment / secrets (never commit)
 .env
-data/arcticloom.db.json
+.env.local
+.env.*.local
+
+# local model cache
 models/
+
+# logs
 *.log
+
+# uploaded files are NEVER stored in the repo - only OS temp staging
+data/
+uploads/
+frontend/frontend/
+
+# next.js build output
+frontend/.next/
+.next/
