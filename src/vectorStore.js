@@ -105,6 +105,32 @@ export async function insertDocument(filename, fileType, fileSize, chunks, embed
     await collection.data.insertMany(objects.slice(i, i + BATCH_SIZE));
   }
 
+  // Read-back verification: Weaviate Cloud can briefly lag behind a successful
+  // write (eventual consistency). Poll until the freshly inserted chunks are
+  // actually retrievable, so a 200 from /api/upload guarantees the document is
+  // listable and searchable immediately afterwards - no "it disappeared" or
+  // "not relevant" moments right after ingestion.
+  const expected = chunks.length;
+  const deadline = Date.now() + 10000;
+  let visible = 0;
+  while (Date.now() < deadline) {
+    try {
+      const check = await collection.query.fetchObjects({
+        filters: collection.filter.byProperty('fileName').equal(filename),
+        limit: expected + 5,
+        returnProperties: ['fileName'],
+      });
+      visible = (check.objects || []).length;
+      if (visible >= expected) break;
+    } catch (e) { /* transient read error - retry until the deadline */ }
+    await new Promise(r => setTimeout(r, 400));
+  }
+  if (visible >= expected) {
+    console.log('Read-back verified: ' + visible + ' chunk(s) visible for "' + filename + '"');
+  } else {
+    console.warn('Read-back: only ' + visible + '/' + expected + ' chunk(s) visible after 10s (write lag) - the document may take a moment to appear.');
+  }
+
   return {
     id: filename,
     filename,
@@ -185,6 +211,57 @@ export async function clearAllData() {
   }
   await ensureCollection();
   conversations = [];
+}
+
+// ===================== OVERVIEW RETRIEVAL =====================
+// Broad questions ("what is this document about?") are about the WHOLE
+// document, so semantic nearest-neighbor search is the wrong tool: they can
+// never score high against any single specific chunk. This returns a
+// REPRESENTATIVE sample instead - the opening chunks (title/purpose) plus
+// evenly spaced chunks across each document - giving the LLM real material
+// to summarize.
+export async function getOverviewChunks(filename = null, perDoc = 6) {
+  await initDatabase();
+  await ensureCollection();
+  const collection = client.collections.get(COLLECTION_NAME);
+
+  const opts = {
+    returnProperties: ['content', 'fileName', 'chunkIndex', 'fileType'],
+    limit: 500,
+  };
+  if (filename) {
+    opts.filters = collection.filter.byProperty('fileName').equal(filename);
+  }
+  const res = await collection.query.fetchObjects(opts);
+
+  const byDoc = {};
+  (res.objects || []).forEach(obj => {
+    const name = obj.properties.fileName;
+    if (!name) return;
+    (byDoc[name] = byDoc[name] || []).push(obj);
+  });
+
+  const chunks = [];
+  Object.values(byDoc).forEach(objs => {
+    objs.sort((a, b) => (a.properties.chunkIndex || 0) - (b.properties.chunkIndex || 0));
+    const total = objs.length;
+    const take = Math.max(1, Math.min(perDoc, total));
+    const seen = new Set();
+    for (let i = 0; i < take; i++) {
+      const pos = Math.round((i * (total - 1)) / Math.max(1, take - 1));
+      if (seen.has(pos)) continue;
+      seen.add(pos);
+      const obj = objs[pos];
+      chunks.push({
+        content: obj.properties.content,
+        filename: obj.properties.fileName,
+        chunk_index: obj.properties.chunkIndex,
+        fileType: obj.properties.fileType,
+        score: null
+      });
+    }
+  });
+  return chunks;
 }
 
 export async function getDocumentCount() {

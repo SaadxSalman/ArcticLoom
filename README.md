@@ -53,6 +53,7 @@ Built with **Node.js 18+, Express 5, Next.js 16, Transformers.js, Weaviate Cloud
 | 🔢 **Local Semantic Embeddings** | `all-MiniLM-L6-v2` runs locally via Transformers.js — your text is vectorized **on your machine** (after the model is downloaded once), producing 384-dimensional, L2-normalized embeddings. |
 | 🗃️ **Weaviate Cloud Vector Database** | Embeddings and metadata (file name, type, size, chunk index, upload timestamp) live in a managed Weaviate collection. Similarity search is fast, filtered, and tunable. |
 | 🤖 **Instruction-Tuned LLM Generation** | `Qwen/Qwen2.5-72B-Instruct` (via the Hugging Face Inference API) synthesizes the final answer from the retrieved evidence — with strict grounding rules and inline citations. |
+| 🧠 **Smart Question Routing** | Broad questions ("what is this document about?", "summarize the key points") are automatically detected and answered from a **representative, evenly-spaced chunk sample** spanning the whole document — instead of being wrongly refused by the similarity gate. Specific questions keep semantic search + the confidence gate, with a lexical-evidence safety net. |
 | 🎯 **Relevance Confidence Gate** | Every query is scored against your documents. If the best match is below the `MIN_RELEVANCE_SCORE` threshold (default 30% / `0.30`), ArcticLoom **refuses to guess** and tells you the documents don't cover the topic. |
 | 📝 **Cited, Verifiable Answers** | The model tags every claim with `[filename | Chunk N]` and ends with a **"Sources used: …"** line. The UI renders source badges with per-file similarity percentages. |
 | 💬 **Multi-Turn Conversation** | Per-session chat history (session IDs stored in your browser's `localStorage`) keeps context across questions — while the model is still explicitly told to answer *only from the documents*. |
@@ -129,8 +130,9 @@ ArcticLoom is a classic **Retrieval-Augmented Generation** pipeline with two asy
    - A `nearVector` search returns the `TOP_K` most similar chunks (default 5), including each chunk's `distance` (converted to a 0–1 similarity score) and metadata.
    - Optional filter: pass `filename` to search within a single document only.
 
-3. **Accuracy gate**
-   - If the single best match scores below `MIN_RELEVANCE_SCORE` (default `0.30`), ArcticLoom **does not invoke the LLM**. Instead it replies honestly: *"The documents are not sufficiently relevant…"* — this is the anti-hallucination guarantee.
+3. **Question routing & accuracy gate**
+   - **Broad/meta questions** ("what is this document about", "summarize…") are detected and answered from a **representative, evenly-spaced sample of chunks** spanning the whole document (semantic search would wrongly score them low, since they are about the document as a whole).
+   - **Specific questions**: if the single best match scores below `MIN_RELEVANCE_SCORE` (default `0.30`), ArcticLoom **does not invoke the LLM**. Instead it replies honestly: *"The documents are not sufficiently relevant…"* — this is the anti-hallucination guarantee.
 
 4. **Synthesis**
    - The top-passing chunks are formatted as citable evidence blocks:
@@ -390,6 +392,21 @@ ArcticLoom will tell you honestly — e.g. *"not sufficiently relevant (best mat
 
 Base URL: `http://localhost:3002` (configurable via `PORT` / `NEXT_PUBLIC_API_URL`). All endpoints return JSON.
 
+### `GET /api/health` — instant liveness probe
+
+Ultra-light endpoint with **zero database dependencies** — responds in a few milliseconds
+even while the backend is still initializing. The frontend polls it every 3 seconds to
+drive the connectivity indicator.
+
+```json
+{ "ok": true, "version": "2.1", "initializing": false, "dbReady": true }
+```
+
+> **Why it exists:** the HTTP server opens its port immediately on startup, while
+> Weaviate and the embedding model initialize in the background. `/api/health` lets the
+> UI distinguish *starting up* from *offline*, and `dbReady: false` tells you
+> upload/ask endpoints will return HTTP 503 (`retryable: true`) for a few seconds.
+
 ### `GET /api/status` — system health
 
 ```json
@@ -543,10 +560,10 @@ node src/ingest.js "C:\path\to\contract.docx"
 
 ## 🎯 Accuracy & Grounding
 
-ArcticLoom is deliberately engineered to **avoid hallucination**:
+ArcticLoom is deliberately engineered to **avoid hallucination**, with smart question routing before retrieval:
 
 1. **Evidence-only answering.** The generation prompt is explicit: base every claim on the provided passages, cite `[filename | Chunk N]`, and *never* use general knowledge to fill gaps.
-2. **Confidence gate.** Retrieval similarity (`1 − distance`, normalized to 0–1) must clear `MIN_RELEVANCE_SCORE` (default 0.30) before the LLM is even consulted. Below that, ArcticLoom answers truthfully that the documents aren't relevant.
+2. **Confidence gate with smart routing.** Retrieval similarity (`1 − distance`, normalized to 0–1) must clear `MIN_RELEVANCE_SCORE` (default 0.30) before the LLM is even consulted. Below that, ArcticLoom answers truthfully that the documents aren't relevant.
 3. **Low-temperature synthesis.** `temperature=0.2` keeps the model conservative and extractive rather than creative.
 4. **Verifiable citations.** Every claim references a concrete chunk, and the web UI shows per-source similarity so you can sanity-check any answer in seconds.
 5. **Honest fallback.** If the Hugging Face API is unavailable or the key is invalid, ArcticLoom returns the top passage verbatim with a disclosure note — it never fabricates an answer.
@@ -582,7 +599,12 @@ Tuning tips:
 | `model_not_supported` from Hugging Face | Your HF token/provider doesn't serve that model | Switch `LLM_MODEL` to a model your token can access (e.g. `Qwen/Qwen2.5-72B-Instruct`) |
 | `address already in use` / port 3002 busy | A previous server instance is still running | `taskkill /F /PID <pid>` (Windows) or `kill <pid>` (Linux/macOS), then restart |
 | Frontend can't reach backend | Wrong `NEXT_PUBLIC_API_URL` | Confirm `frontend/.env.local` points at the backend URL, restart `npm run dev` |
-| Uploaded PDF yields "Insufficient text extracted" | Scanned/image-only PDF (no text layer) | Use an OCR'd/exported text PDF, or save as Markdown/TXT |
+| `Invalid PDF structure` on upload | PDF with a broken/missing xref table, leading junk, or a partial download | ArcticLoom auto-recovers most of these with its built-in fallback extractor; if the file still fails, re-download/re-export it and try again |
+| `"… is not a valid PDF (no %PDF header found)"` | The file isn't really a PDF — often an HTML error page, image, or `.docx` renamed to `.pdf` | Verify the source; re-export a genuine PDF (avoid right-click "save link as" on pages that return HTML) |
+| `"… is password-protected"` | Encrypted PDF (owner or user password) | Remove the password — open in any PDF reader and re-save via Print → Save as PDF — then upload again |
+| `"… appears truncated or corrupted (missing %%EOF)"` | Incomplete file (interrupted download/export) | Re-download or re-export the complete file |
+| Uploaded PDF yields "No extractable text found" | Scanned/image-only PDF (no text layer) | Run OCR (e.g. Acrobat "Recognize Text", ocrmypdf) or export to Markdown/TXT |
+| UI shows red "Backend is offline" banner | Backend not started, or in its first seconds of boot | Run `npm start` in the ArcticLoom folder; the UI reconnects automatically (green "Backend connected" pill) once `/api/health` responds |
 | Embedding model stuck at "Loading…" | First-time download or HF model cache issue | Ensure internet access; delete `~/…/.cache` for `@xenova/transformers` or `models/` and retry |
 | Slow answers | Large docs, cold cache, or a 72B model call | Raise `MIN_RELEVANCE_SCORE`, lower `TOP_K`, split large PDFs into chapters |
 

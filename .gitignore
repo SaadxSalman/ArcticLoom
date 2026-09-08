@@ -20,3 +20,5 @@ frontend/frontend/
 # next.js build output
 frontend/.next/
 .next/
+# typescript build info
+*.tsbuildinfo

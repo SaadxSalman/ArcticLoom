@@ -26,23 +26,35 @@ export async function initLLM() {
  * The prompt is engineered for accuracy: the model is told to rely ONLY on
  * the supplied passages and to cite every claim by source.
  */
-export async function generateResponse(query, context, conversationHistory = []) {
+export async function generateResponse(query, context, conversationHistory = [], options = {}) {
+  const mode = options.mode === 'overview' ? 'overview' : 'specific';
   const historyPrompt = conversationHistory.length > 0
     ? '\n\nCONVERSATION HISTORY (for continuity only, do not answer from it):\n' +
       conversationHistory.map(h => '[' + h.role + ']: ' + h.content).join('\n') + '\n'
     : '';
 
-  const prompt = `You are ArcticLoom AI, an expert research assistant that answers questions using ONLY the provided document context.
+  const taskBlock = mode === 'overview'
+    ? `TASK (overview mode):
+The passages below are a REPRESENTATIVE SAMPLE spanning the document(s) from beginning to end, including the opening sections which usually state the title and purpose. The user is asking a broad question about what the document(s) are.
 
-GROUNDING RULES (strict):
-1. Base every claim on the numbered passages inside DOCUMENT CONTEXT.
+1. Describe what the document(s) are about: their subject, purpose, intended audience and main topics/sections, based ONLY on these passages.
+2. You MAY synthesize information across passages and structure the answer with short bullet points.
+3. Cite passages inline using their bracketed tags, e.g. [report.pdf | Chunk 0].
+4. Never invent sections, headings, numbers or facts that are not present in the passages.
+5. At the very end, add a line "Sources used: " followed by the unique [filename | Chunk N] tags you actually cited.`
+    : `GROUNDING RULES (strict):
+1. Base every claim on the passages inside DOCUMENT CONTEXT.
 2. Cite sources inline using their bracketed tag, e.g. [report.pdf | Chunk 2].
 3. If the context does not contain enough information to answer, reply exactly:
    "The uploaded documents do not contain enough information to answer this question." and stop.
 4. Never invent facts, numbers, names, or figures. Do not use general knowledge to fill gaps.
 5. Be comprehensive but stay strictly within the evidence. Prefer exact terms from the documents.
 6. Structure long answers with short paragraphs or bullet points when helpful.
-7. At the very end, add a line "Sources used: " followed by the unique [filename | Chunk N] tags you actually cited.
+7. At the very end, add a line "Sources used: " followed by the unique [filename | Chunk N] tags you actually cited.`;
+
+  const prompt = `You are ArcticLoom AI, an expert research assistant answering questions about documents the user uploaded.
+
+${taskBlock}
 
 DOCUMENT CONTEXT:${historyPrompt}
 ${context}

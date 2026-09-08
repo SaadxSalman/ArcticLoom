@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, type ReactNode } from 'react';
 import { Brain, FileText, Loader2, Sparkles, Upload, Trash2, Database, Send, ChevronDown, ChevronUp, Zap, Plus, RefreshCw } from 'lucide-react';
 
 interface Source { filename: string; score: number; }
@@ -17,6 +17,27 @@ function shorten(name: string, max = 30): string {
   return name.length > max ? name.slice(0, max - 2) + '…' : name;
 }
 
+/** Minimal inline markdown renderer: **bold**, *italic*, `code` -> styled nodes.
+ *  Keeps whitespace/line breaks (the parent <p> is whitespace-pre-wrap), so
+ *  LLM bullet lists and emphasis render logically instead of raw asterisks. */
+function renderInline(text: string, keyBase: string): ReactNode[] {
+  const parts: ReactNode[] = [];
+  const re = /\*\*([^*]+)\*\*|\*([^*\n]+)\*|`([^`\n]+)`/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let i = 0;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) parts.push(text.slice(last, m.index));
+    if (m[1] !== undefined) parts.push(<strong key={keyBase + i} className="font-semibold text-white">{m[1]}</strong>);
+    else if (m[2] !== undefined) parts.push(<em key={keyBase + i} className="italic text-slate-200">{m[2]}</em>);
+    else parts.push(<code key={keyBase + i} className="px-1 py-0.5 bg-slate-800/80 border border-slate-700 rounded text-cyan-300 text-[11px]">{m[3]}</code>);
+    i++;
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
+}
+
 export default function Home() {
   const [query, setQuery] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
@@ -26,7 +47,8 @@ export default function Home() {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [showDocs, setShowDocs] = useState(false);
   const [stats, setStats] = useState({ documents: 0, chunks: 0 });
-  const [backendOnline, setBackendOnline] = useState(true);
+  const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+  const wasOnlineRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -51,11 +73,31 @@ export default function Home() {
   };
   const sessionId = getSessionId();
 
-  useEffect(() => { fetchDocuments(); fetchStats(); }, []);
+  // Instant liveness check against /api/health (no DB calls - never hangs).
+  const fetchHealth = async (): Promise<boolean> => {
+    try {
+      const ctrl = new AbortController();
+      const t = window.setTimeout(() => ctrl.abort(), 3500);
+      const r = await fetch(API_URL + '/api/health', { signal: ctrl.signal, cache: 'no-store' });
+      window.clearTimeout(t);
+      const ok = r.ok;
+      setBackendOnline(ok);
+      if (ok && !wasOnlineRef.current) { wasOnlineRef.current = true; fetchDocuments(); fetchStats(); }
+      if (!ok) wasOnlineRef.current = false;
+      return ok;
+    } catch (e) {
+      setBackendOnline(false);
+      wasOnlineRef.current = false;
+      return false;
+    }
+  };
 
-  // Poll the backend every 5s; drives the connectivity banner + button states.
+  useEffect(() => { fetchHealth(); }, []);
+
+  // Poll backend liveness every 3s; refresh documents/stats whenever the
+  // connection transitions from offline back to online.
   useEffect(() => {
-    const timer = window.setInterval(() => { fetchStats(); }, 5000);
+    const timer = window.setInterval(() => { fetchHealth(); }, 3000);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -91,7 +133,7 @@ export default function Home() {
   const handleSearch = async () => {
     const text = query.trim();
     if (!text || loading) return;
-    if (!backendOnline) { fetchStats(); pushMessage({ role: 'assistant', content: '⚠️ The backend is offline. Start it with `npm start` in the ArcticLoom folder, then try again.', isError: true, timestamp: new Date() }); return; }
+    if (backendOnline === false) { fetchStats(); pushMessage({ role: 'assistant', content: '⚠️ The backend is offline. Start it with `npm start` in the ArcticLoom folder, then try again.', isError: true, timestamp: new Date() }); return; }
     pushMessage({ role: 'user', content: text, timestamp: new Date() });
     setQuery('');
     setLoading(true);
@@ -116,7 +158,7 @@ export default function Home() {
 
   // ==================== UPLOAD (fresh files only - no data folder) ====================
   const handleFileUpload = async (file: File) => {
-    if (!backendOnline) { fetchStats(); pushMessage({ role: 'assistant', content: '⚠️ The backend is offline. Start it with `npm start`, then upload again.', isError: true, timestamp: new Date() }); return; }
+    if (backendOnline === false) { fetchHealth(); pushMessage({ role: 'assistant', content: '⚠️ The backend is offline. Start it with `npm start`, then upload again.', isError: true, timestamp: new Date() }); return; }
     const fd = new FormData();
     fd.append('file', file);
     setUploading(true);
@@ -133,12 +175,16 @@ export default function Home() {
           timestamp: new Date()
         });
         fetchDocuments(); fetchStats();
+      } else if (r.status === 503) {
+        pushMessage({ role: 'assistant', content: '⏳ ' + ((d.error as string) || 'Backend is still initializing - retry in a few seconds.'), timestamp: new Date() });
+        window.setTimeout(() => { fetchHealth(); fetchDocuments(); fetchStats(); }, 3000);
       } else {
-        pushMessage({ role: 'assistant', content: '⚠️ Upload failed: ' + (d.error || ('HTTP ' + r.status)), isError: true, timestamp: new Date() });
+        pushMessage({ role: 'assistant', content: '⚠️ Upload failed: ' + ((d.error as string) || ('HTTP ' + r.status)), isError: true, timestamp: new Date() });
       }
     } catch (e) {
       setBackendOnline(false);
-      pushMessage({ role: 'assistant', content: '⚠️ Upload failed - could not reach the backend (' + API_URL + '). Make sure `npm start` is running, then try again.', isError: true, timestamp: new Date() });
+      pushMessage({ role: 'assistant', content: '⚠️ Could not reach the backend at ' + API_URL + '. It is either offline or still starting. Wait for the green "Backend connected" pill (re-checked every 3s), then try again.', isError: true, timestamp: new Date() });
+      fetchHealth();
     } finally { setUploading(false); setUploadName(''); }
   };
 
@@ -175,6 +221,12 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-animated-gradient text-slate-200">
       <div className="max-w-6xl mx-auto px-4 py-6 h-screen flex flex-col">
+        {/* Hidden file input lives OUTSIDE any conditional panel so the center
+            upload button, the Docs-panel button and drag & drop always work,
+            even while the Docs list is collapsed. */}
+        <input ref={fileInputRef} type="file" className="hidden"
+          accept=".pdf,.docx,.md,.markdown,.txt,.csv,.json,.html,.htm"
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileUpload(f); e.currentTarget.value = ''; }} />
         <header className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-3">
             <div className="p-2.5 bg-blue-500/10 rounded-xl border border-blue-500/20 glow-blue"><Brain className="w-7 h-7 text-blue-400" /></div>
@@ -203,7 +255,13 @@ export default function Home() {
           </div>
         </header>
 
-        {!backendOnline && (
+        {backendOnline === null && (
+          <div className="mb-4 flex items-center gap-2 px-4 py-2.5 bg-amber-500/10 border border-amber-500/30 rounded-xl text-xs text-amber-300 animate-fade-in-up">
+            <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin" />
+            <span>Connecting to the backend at <code className="text-amber-300">{API_URL}</code>…</span>
+          </div>
+        )}
+        {backendOnline === false && (
           <div className="mb-4 flex items-center gap-2 px-4 py-2.5 bg-red-500/10 border border-red-500/30 rounded-xl text-xs text-red-300 animate-fade-in-up">
             <Zap className="w-3.5 h-3.5 shrink-0" />
             <span>
@@ -212,7 +270,7 @@ export default function Home() {
             </span>
           </div>
         )}
-        {backendOnline && (
+        {backendOnline === true && (
           <div className="mb-4 flex items-center gap-2 px-4 py-1.5 bg-green-500/10 border border-green-500/20 rounded-full text-[10px] text-green-400">
             <span>●</span>Backend connected
           </div>
@@ -232,9 +290,6 @@ export default function Home() {
                   </button>
                 )}
               </div>
-              <input ref={fileInputRef} type="file" className="hidden"
-                accept=".pdf,.docx,.md,.markdown,.txt,.csv,.json,.html,.htm"
-                onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])} />
             </div>
             {!hasDocs ? (
               <p className="text-xs text-slate-500 text-center py-4">
@@ -271,11 +326,11 @@ export default function Home() {
                     ArcticLoom answers questions strictly from the files <span className="text-slate-400">you</span> provide.
                     Upload a fresh file (drag & drop or click below) - previously uploaded files are never reused.
                   </p>
-                  <button onClick={() => fileInputRef.current?.click()} disabled={!backendOnline}
+                  <button onClick={() => fileInputRef.current?.click()} disabled={backendOnline === false}
                     className="flex items-center gap-2 px-6 py-3 bg-blue-600/20 border border-blue-500/40 rounded-2xl text-sm text-blue-300 hover:bg-blue-600/30 glow-blue disabled:opacity-40">
-                    <Plus className="w-5 h-5" />{backendOnline ? 'Upload your first document' : 'Start the backend first'}
+                    <Plus className="w-5 h-5" />{backendOnline === false ? 'Start the backend first' : backendOnline === null ? 'Connecting…' : 'Upload your first document'}
                   </button>
-                  {!backendOnline && (
+                  {backendOnline === false && (
                     <p className="text-xs text-red-400 max-w-md">
                       Start the backend with <code>npm start</code> in the ArcticLoom folder, wait for the green "Backend connected" pill, then upload.
                     </p>
@@ -306,14 +361,14 @@ export default function Home() {
                   <div className="flex items-start gap-2">
                     <div className="p-1.5 bg-cyan-500/10 rounded-lg mt-0.5 shrink-0"><Sparkles className="w-4 h-4 text-cyan-400" /></div>
                     <p className={'text-sm leading-relaxed whitespace-pre-wrap flex-1 ' + (msg.isError ? 'text-red-400' : 'text-slate-300')}>
-                      {msg.content}
+                      {renderInline(msg.content, 'm' + idx + '-')}
                     </p>
                   </div>
                   {msg.sources && msg.sources.length > 0 && (
                     <div className="ml-8 flex flex-wrap gap-1.5">
                       {msg.sources.map((src, i) => (
-                        <span key={i} title={'Similarity: ' + (src.score * 100).toFixed(1) + '%'} className="px-2 py-0.5 bg-blue-500/10 border border-blue-500/20 text-blue-400 text-xs rounded-full">
-                          {src.filename} · {(src.score * 100).toFixed(0)}%
+                        <span key={i} title={src.score != null ? 'Similarity: ' + (src.score * 100).toFixed(1) + '%' : 'Overview source'} className="px-2 py-0.5 bg-blue-500/10 border border-blue-500/20 text-blue-400 text-xs rounded-full">
+                          {src.filename}{src.score != null ? ' · ' + (src.score * 100).toFixed(0) + '%' : ''}
                         </span>
                       ))}
                     </div>
